@@ -1,6 +1,12 @@
 """
-UWB Tag Live Visualizer  — v4 (fixed room bounds + clamped tag)
+UWB Tag Live Visualizer  — v5 (smooth edition)
 ==================================================
+Smoothing stack (applied in order):
+  1. Median pre-filter on incoming distances (window=5) — kills single-sample spikes
+  2. Distance outlier gate — ignores readings >DIST_OUTLIER_GATE metres from the rolling median
+  3. 2-D Kalman filter on the computed position — optimal for noisy sensor tracking
+  4. Velocity cap — prevents teleport jumps from bad trilateration solutions
+
 On launch, asks for the 3 anchor positions before starting.
 Press Enter on each field, then click Start.
 
@@ -28,15 +34,33 @@ DEFAULT_ANCHORS = {
 }
 
 UDP_PORT     = 5005
-TRAIL_LENGTH = 80
-PAD          = 0.0          # no padding — axes start exactly at room bounds
+TRAIL_LENGTH = 120
+PAD          = 0.0
 
 ANCHOR_COLORS = {1: "#e74c3c", 2: "#3498db", 3: "#2ecc71"}
 TAG_COLOR     = "#f39c12"
 
-# ─── Smoothing ────────────────────────────────────────────────────────────────
-SMOOTH_ALPHA = 0.25
-UPDATE_MS    = 50
+UPDATE_MS = 50   # animation refresh interval (ms)
+
+# ─── Smoothing knobs ──────────────────────────────────────────────────────────
+# 1. Median pre-filter window for each anchor's distance history
+MEDIAN_WINDOW = 5          # keep last N readings, use median for trilateration
+
+# 2. Distance outlier gate (applied after median; in metres)
+DIST_OUTLIER_GATE = 1.5    # reject a distance if it's >this many metres from
+                           # the running median — catches big NLOS spikes
+
+# 3. Kalman filter process/measurement noise
+#    Q: process noise covariance — lower = trust model more (less jitter)
+#       but slower to follow fast movement. Try 0.005–0.05.
+#    R: measurement noise covariance — higher = trust measurements less.
+#       Try 0.5–3.0 depending on how noisy your env is.
+KALMAN_Q = 0.01    # process noise
+KALMAN_R = 1.0     # measurement noise
+
+# 4. Maximum plausible speed of the tag (m/s).
+#    Jumps larger than this × dt are capped to this speed.
+MAX_SPEED_M_S = 2.0   # ~fast walking; lower for slow-moving objects
 
 # ─── Will be filled after calibration ────────────────────────────────────────
 ANCHOR_POSITIONS = {}
@@ -44,13 +68,88 @@ ANCHOR_POSITIONS = {}
 # ─── Shared state ─────────────────────────────────────────────────────────────
 state = {
     "distances":    {1: None, 2: None, 3: None},
-    "tag_pos":      None,
-    "smoothed_pos": None,
+    "tag_pos":      None,   # raw trilaterated position
+    "smoothed_pos": None,   # Kalman-filtered position
     "trail":        deque(maxlen=TRAIL_LENGTH),
     "last_update":  0.0,
     "packets":      0,
 }
 lock = threading.Lock()
+
+# Per-anchor distance history for median filter
+dist_history = {1: deque(maxlen=MEDIAN_WINDOW),
+                2: deque(maxlen=MEDIAN_WINDOW),
+                3: deque(maxlen=MEDIAN_WINDOW)}
+
+
+# ─── 2-D Kalman Filter ────────────────────────────────────────────────────────
+# State vector: [x, y, vx, vy]
+# Constant-velocity model.
+
+class KalmanFilter2D:
+    def __init__(self, q=KALMAN_Q, r=KALMAN_R):
+        self.initialized = False
+        # State estimate [x, y, vx, vy]
+        self.x = np.zeros(4)
+        # State covariance
+        self.P = np.eye(4) * 1.0
+        # Transition matrix (updated every step with actual dt)
+        self.F = np.eye(4)
+        # Measurement matrix (we observe x, y only)
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]], dtype=float)
+        # Process noise covariance
+        self.Q_base = q
+        # Measurement noise covariance
+        self.R = np.eye(2) * r
+
+    def _build_F(self, dt):
+        F = np.eye(4)
+        F[0, 2] = dt
+        F[1, 3] = dt
+        return F
+
+    def _build_Q(self, dt):
+        # Discretised white noise acceleration model
+        q = self.Q_base
+        dt2, dt3, dt4 = dt**2, dt**3, dt**4
+        Q = np.array([
+            [dt4/4, 0,     dt3/2, 0    ],
+            [0,     dt4/4, 0,     dt3/2],
+            [dt3/2, 0,     dt2,   0    ],
+            [0,     dt3/2, 0,     dt2  ],
+        ]) * q
+        return Q
+
+    def update(self, meas_x, meas_y, dt):
+        """Feed a new measurement; returns (filtered_x, filtered_y)."""
+        z = np.array([meas_x, meas_y])
+
+        if not self.initialized:
+            self.x = np.array([meas_x, meas_y, 0.0, 0.0])
+            self.initialized = True
+            return meas_x, meas_y
+
+        dt = max(dt, 1e-3)
+        F  = self._build_F(dt)
+        Q  = self._build_Q(dt)
+
+        # Predict
+        x_pred = F @ self.x
+        P_pred = F @ self.P @ F.T + Q
+
+        # Update
+        y_res  = z - self.H @ x_pred
+        S      = self.H @ P_pred @ self.H.T + self.R
+        K      = P_pred @ self.H.T @ np.linalg.inv(S)
+        self.x = x_pred + K @ y_res
+        self.P = (np.eye(4) - K @ self.H) @ P_pred
+
+        return float(self.x[0]), float(self.x[1])
+
+
+kalman = KalmanFilter2D()
+last_kalman_time = None   # wall-clock time of last Kalman update
 
 
 # ─── Trilateration ────────────────────────────────────────────────────────────
@@ -76,9 +175,28 @@ def trilaterate(d1, d2, d3):
         return None
 
 
+def median_distances():
+    """Return median-filtered distances for each anchor (or None if not enough data)."""
+    result = {}
+    for aid in (1, 2, 3):
+        h = list(dist_history[aid])
+        if len(h) == 0:
+            result[aid] = None
+        else:
+            med = float(np.median(h))
+            # Gate: reject latest sample if it's far from the median
+            if len(h) >= 2 and abs(h[-1] - med) > DIST_OUTLIER_GATE:
+                # Use median of the rest (without the outlier)
+                med = float(np.median(h[:-1]))
+            result[aid] = med
+    return result
+
+
 # ─── UDP listener ─────────────────────────────────────────────────────────────
 
 def udp_listener():
+    global last_kalman_time
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", UDP_PORT))
@@ -95,34 +213,65 @@ def udp_listener():
                 if len(parts) == 3:
                     try:
                         d1, d2, d3 = float(parts[0]), float(parts[1]), float(parts[2])
-                        pos = trilaterate(d1, d2, d3)
+
+                        # Feed raw distances into per-anchor history
+                        for aid, d in zip((1, 2, 3), (d1, d2, d3)):
+                            if d > 0:
+                                dist_history[aid].append(d)
+
+                        # Get median-filtered distances
+                        meds = median_distances()
+                        md1, md2, md3 = meds[1], meds[2], meds[3]
+
+                        if md1 is not None and md2 is not None and md3 is not None:
+                            pos = trilaterate(md1, md2, md3)
+                        else:
+                            pos = None
+
                         with lock:
                             state["distances"][1] = d1
                             state["distances"][2] = d2
                             state["distances"][3] = d3
                             state["packets"] += 1
+                            _print_raw = None
+                            _print_sp  = None
+
                             if pos:
                                 state["tag_pos"] = pos
-                                sp = state["smoothed_pos"]
-                                if sp is None:
-                                    state["smoothed_pos"] = pos
-                                else:
-                                    state["smoothed_pos"] = (
-                                        SMOOTH_ALPHA * pos[0] + (1 - SMOOTH_ALPHA) * sp[0],
-                                        SMOOTH_ALPHA * pos[1] + (1 - SMOOTH_ALPHA) * sp[1],
-                                    )
-                                # Clamp to room bounds so tag never renders outside
-                                _ax_vals = [p[0] for p in ANCHOR_POSITIONS.values()]
-                                _ay_vals = [p[1] for p in ANCHOR_POSITIONS.values()]
-                                cx = float(np.clip(state["smoothed_pos"][0], min(_ax_vals), max(_ax_vals)))
-                                cy = float(np.clip(state["smoothed_pos"][1], min(_ay_vals), max(_ay_vals)))
-                                state["smoothed_pos"] = (cx, cy)
+
+                                # Velocity cap — prevent teleport jumps
+                                now = time.time()
+                                dt  = (now - last_kalman_time) if last_kalman_time else 0.2
+                                last_kalman_time = now
+
+                                prev = state["smoothed_pos"]
+                                if prev is not None:
+                                    dx = pos[0] - prev[0]
+                                    dy = pos[1] - prev[1]
+                                    dist_step = np.hypot(dx, dy)
+                                    max_step  = MAX_SPEED_M_S * dt
+                                    if dist_step > max_step and dist_step > 0:
+                                        # Clamp the raw measurement toward prev
+                                        scale = max_step / dist_step
+                                        pos = (prev[0] + dx * scale,
+                                               prev[1] + dy * scale)
+
+                                # Kalman update
+                                kx, ky = kalman.update(pos[0], pos[1], dt)
+                                state["smoothed_pos"] = (kx, ky)
                                 state["trail"].append(state["smoothed_pos"])
                                 state["last_update"] = time.time()
-                        if pos:
-                            print(f"  TAG raw=({pos[0]:.2f},{pos[1]:.2f}) "
-                                  f"smooth=({state['smoothed_pos'][0]:.2f},"
-                                  f"{state['smoothed_pos'][1]:.2f}) m")
+                                # capture inside lock so print below is race-free
+                                _print_raw = pos
+                                _print_sp  = state["smoothed_pos"]
+                            else:
+                                _print_raw = None
+                                _print_sp  = None
+
+                        if _print_raw:
+                            print(f"  TAG raw=({_print_raw[0]:.2f},{_print_raw[1]:.2f}) "
+                                  f"kalman=({_print_sp[0]:.2f},{_print_sp[1]:.2f}) m")
+
                     except ValueError:
                         pass
 
@@ -130,7 +279,8 @@ def udp_listener():
                 try:
                     aid  = int(msg[1])
                     dist = float(msg.split(":")[1])
-                    if aid in (1, 2, 3):
+                    if aid in (1, 2, 3) and dist > 0:
+                        dist_history[aid].append(dist)
                         with lock:
                             state["distances"][aid] = dist
                 except (ValueError, IndexError):
@@ -157,7 +307,7 @@ def show_calibration():
             transform=ax.transAxes, color="white",
             fontsize=15, fontweight="bold", ha="center", va="top")
     ax.text(0.5, 0.87,
-            "Enter each anchor's position (meters from your room corner).\n"
+            "Enter each anchor's position (metres from your room corner).\n"
             "A1 is always the origin — keep it at 0, 0.",
             transform=ax.transAxes, color="#aaaaaa",
             fontsize=9, ha="center", va="top")
@@ -208,8 +358,7 @@ def show_calibration():
         spine.set_edgecolor("#333355")
     ax_preview.set_title("Anchor layout preview", color="#888888",
                           fontsize=8, pad=4)
-    preview_dots = {}
-    preview_labels = {}
+    preview_dots, preview_labels = {}, {}
     for aid in (1, 2, 3):
         x, y = DEFAULT_ANCHORS[aid]
         dot, = ax_preview.plot(x, y, "^", markersize=10,
@@ -254,14 +403,13 @@ def show_calibration():
                 y = float(text_boxes[aid][1].text)
                 ANCHOR_POSITIONS[aid] = (x, y)
             except ValueError:
-                print(f"[Calibration] Invalid value for Anchor {aid} — check input")
+                print(f"[Calibration] Invalid value for Anchor {aid}")
                 ok = False
         if ok:
             result["started"] = True
             plt.close(fig_cal)
 
     btn_start.on_clicked(on_start)
-
     plt.show()
     return result["started"]
 
@@ -272,39 +420,33 @@ def show_visualizer():
     _ax = [p[0] for p in ANCHOR_POSITIONS.values()]
     _ay = [p[1] for p in ANCHOR_POSITIONS.values()]
 
-    # Fixed room bounds — never change during runtime
-    X_MIN = min(_ax) - PAD
-    X_MAX = max(_ax) + PAD
-    Y_MIN = min(_ay) - PAD
-    Y_MAX = max(_ay) + PAD
+    X_MIN, X_MAX = min(_ax) - PAD, max(_ax) + PAD
+    Y_MIN, Y_MAX = min(_ay) - PAD, max(_ay) + PAD
     ROOM_XLIM = (X_MIN, X_MAX)
     ROOM_YLIM = (Y_MIN, Y_MAX)
 
     fig, ax = plt.subplots(figsize=(9, 7))
     fig.patch.set_facecolor("#1a1a2e")
-    fig.canvas.manager.set_window_title("UWB Tag — Live Position")
+    fig.canvas.manager.set_window_title("UWB Tag — Live Position (smooth)")
     ax.set_facecolor("#16213e")
     ax.set_xlim(*ROOM_XLIM)
     ax.set_ylim(*ROOM_YLIM)
-    ax.set_xlabel("X (meters)", color="white")
-    ax.set_ylabel("Y (meters)", color="white")
+    ax.set_xlabel("X (metres)", color="white")
+    ax.set_ylabel("Y (metres)", color="white")
     ax.tick_params(colors="white")
-    ax.set_title("UWB Tag — Live Position", color="white", fontsize=14, pad=10)
+    ax.set_title("UWB Tag — Live Position  [Kalman + Median filter]",
+                 color="white", fontsize=14, pad=10)
     for spine in ax.spines.values():
         spine.set_edgecolor("#444")
     ax.grid(True, color="#2a2a4a", linewidth=0.5)
 
-    # Draw room boundary rectangle
-    room_w = max(_ax) - min(_ax)
-    room_h = max(_ay) - min(_ay)
     room_rect = plt.Rectangle(
-        (min(_ax), min(_ay)), room_w, room_h,
+        (min(_ax), min(_ay)), max(_ax)-min(_ax), max(_ay)-min(_ay),
         linewidth=1.5, edgecolor="#4a4a8a", facecolor="#1c2340",
         linestyle="-", zorder=1
     )
     ax.add_patch(room_rect)
 
-    # Static anchors
     for aid, (ax_, ay_) in ANCHOR_POSITIONS.items():
         ax.plot(ax_, ay_, "^", markersize=15, color=ANCHOR_COLORS[aid],
                 markeredgecolor="white", markeredgewidth=1.2, zorder=5)
@@ -331,7 +473,7 @@ def show_visualizer():
                      fontsize=9, va="top", family="monospace")
 
     patches = [mpatches.Patch(color=ANCHOR_COLORS[i], label=f"Anchor {i}") for i in (1, 2, 3)]
-    patches.append(mpatches.Patch(color=TAG_COLOR, label="Tag"))
+    patches.append(mpatches.Patch(color=TAG_COLOR, label="Tag (Kalman)"))
     ax.legend(handles=patches, loc="lower right",
               facecolor="#1a1a2e", edgecolor="#444",
               labelcolor="white", fontsize=9)
@@ -362,13 +504,14 @@ def show_visualizer():
             tag_dot.set_data([], [])
             tag_label.set_text("")
 
-        # Always lock axes to room bounds — never auto-expand
         ax.set_xlim(*ROOM_XLIM)
         ax.set_ylim(*ROOM_YLIM)
 
+        # Show median-filtered distances on the circles
+        meds = median_distances()
         for aid in (1, 2, 3):
-            d = dists.get(aid)
-            circles[aid].set_radius(d if d and d > 0 else 0)
+            r = meds[aid] if meds[aid] else 0
+            circles[aid].set_radius(r if r > 0 else 0)
 
         d1s = f"{dists[1]:.2f}" if dists[1] else "---"
         d2s = f"{dists[2]:.2f}" if dists[2] else "---"
@@ -377,7 +520,7 @@ def show_visualizer():
         raw_str = f"({raw_pos[0]:.2f}, {raw_pos[1]:.2f}) m" if raw_pos else "---"
         status.set_text(
             f"d1={d1s}m   d2={d2s}m   d3={d3s}m\n"
-            f"Position (smooth) : {pos_str}\n"
+            f"Position (Kalman) : {pos_str}\n"
             f"Position (raw)    : {raw_str}\n"
             f"Packets: {packets}    Last update: {age:.1f}s ago"
         )
