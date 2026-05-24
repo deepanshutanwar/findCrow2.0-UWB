@@ -1,15 +1,13 @@
 /*
  * ============================================================
- *  UWB TAG FIRMWARE  — v3 (rewritten from official Makerfabs examples)
+ *  UWB TAG FIRMWARE  — v4 (smooth edition)
  *  For: Makerfabs ESP32 UWB Pro with Display
  *
- *  This is the MOVING device to track. Flash ONLY to the Pro+Display board.
- *
- *  Uses DW1000Ranging library (high-level TWR, built into mf_DW1000).
- *  The tag polls each anchor automatically — the ranging library handles
- *  the TWR protocol internally. No manual timestamp management needed.
- *
- *  Pins verified from official Makerfabs GitHub README.
+ *  Changes from v3:
+ *    - Per-anchor EMA (exponential moving average) filter on raw distances
+ *    - Outlier rejection: readings more than OUTLIER_FACTOR× the last
+ *      smoothed value are discarded (multipath / NLOS spikes)
+ *    - Sends smoothed distances to PC instead of raw readings
  * ============================================================
  */
 
@@ -28,47 +26,62 @@ const char* PC_IP     = "10.8.60.205";
 const int   UDP_PORT  = 5005;
 // ──────────────────────────────────────────────────────────────────────────────
 
+// ─── SMOOTHING PARAMETERS ─────────────────────────────────────────────────────
+// EMA alpha for distance smoothing (lower = smoother but more lag)
+// 0.1 = heavy smooth, 0.3 = moderate. Try 0.15 first.
+#define DIST_EMA_ALPHA   0.15f
+
+// Reject a new reading if it differs from the smoothed value by more than
+// this factor (e.g. 2.5 = reject if >2.5× or <1/2.5× the last smooth value).
+// Catches NLOS / multipath spikes. Set higher (e.g. 4.0) in open environments.
+#define OUTLIER_FACTOR   2.5f
+
+// Minimum valid distance (metres). Readings below this are hardware noise.
+#define MIN_DIST_M       0.05f
+
+// Maximum valid distance (metres). Readings above this are unreliable.
+#define MAX_DIST_M       50.0f
+// ──────────────────────────────────────────────────────────────────────────────
+
 // Verified SPI + DW1000 pins for Makerfabs ESP32 UWB Pro with Display
-// Source: https://github.com/Makerfabs/Makerfabs-ESP32-UWB README
 #define SPI_SCK   18
 #define SPI_MISO  19
 #define SPI_MOSI  23
-#define PIN_SS    21   // UWB_SS — Pro with Display uses GPIO21
+#define PIN_SS    21
 #define PIN_RST   27
 #define PIN_IRQ   34
 
-// OLED pins — Pro with Display uses GPIO4=SDA, GPIO5=SCL
+// OLED pins
 #define OLED_SDA   4
 #define OLED_SCL   5
 #define OLED_W   128
 #define OLED_H    64
 
-// Tag's own address — must be char[], not const char* or #define
 char TAG_ADDRESS[] = "7D:00";
 
-// How many anchors to expect
 #define NUM_ANCHORS 3
 
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
 WiFiUDP udp;
 
-// Store distances indexed by anchor short address
 struct AnchorData {
   uint16_t shortAddr;
-  float    distance;
+  float    rawDistance;       // last raw reading (for debug)
+  float    smoothedDistance;  // EMA-filtered distance sent to PC
   bool     active;
+  bool     initialized;       // true after first valid reading
 };
 
 AnchorData anchors[NUM_ANCHORS] = {
-  {0x1783, 0.0, false},  // "83:17" Anchor 1
-  {0x1784, 0.0, false},  // "84:17" Anchor 2
-  {0x1785, 0.0, false},  // "85:17" Anchor 3
+  {0x1783, 0.0, 0.0, false, false},  // "83:17" Anchor 1
+  {0x1784, 0.0, 0.0, false, false},  // "84:17" Anchor 2
+  {0x1785, 0.0, 0.0, false, false},  // "85:17" Anchor 3
 };
 
 unsigned long lastSendTime = 0;
-const unsigned long SEND_INTERVAL_MS = 200;  // send to PC every 200ms
+const unsigned long SEND_INTERVAL_MS = 200;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 int findAnchorIndex(uint16_t addr) {
   for (int i = 0; i < NUM_ANCHORS; i++) {
@@ -78,11 +91,39 @@ int findAnchorIndex(uint16_t addr) {
 }
 
 int anchorIdForAddr(uint16_t addr) {
-  // Map short address back to anchor ID 1/2/3
   if (addr == 0x1783) return 1;
   if (addr == 0x1784) return 2;
   if (addr == 0x1785) return 3;
   return 0;
+}
+
+// Returns true if the reading passes sanity checks and updates the smoothed value.
+bool applyFilter(AnchorData &a, float newDist) {
+  // Hard range bounds
+  if (newDist < MIN_DIST_M || newDist > MAX_DIST_M) return false;
+
+  // Seed the filter on first valid reading
+  if (!a.initialized) {
+    a.smoothedDistance = newDist;
+    a.initialized = true;
+    a.rawDistance = newDist;
+    return true;
+  }
+
+  // Outlier rejection — compare to current smoothed value
+  float ratio = newDist / a.smoothedDistance;
+  if (ratio > OUTLIER_FACTOR || ratio < (1.0f / OUTLIER_FACTOR)) {
+    // Spike detected — discard this reading entirely
+    Serial.printf("  [filter] outlier rejected: raw=%.3f smooth=%.3f\n",
+                  newDist, a.smoothedDistance);
+    return false;
+  }
+
+  // EMA update
+  a.rawDistance      = newDist;
+  a.smoothedDistance = DIST_EMA_ALPHA * newDist
+                     + (1.0f - DIST_EMA_ALPHA) * a.smoothedDistance;
+  return true;
 }
 
 void updateDisplay() {
@@ -95,7 +136,7 @@ void updateDisplay() {
   for (int i = 0; i < NUM_ANCHORS; i++) {
     int aid = anchorIdForAddr(anchors[i].shortAddr);
     if (anchors[i].active) {
-      display.printf("A%d: %.2f m\n", aid, anchors[i].distance);
+      display.printf("A%d: %.2f m\n", aid, anchors[i].smoothedDistance);
     } else {
       display.printf("A%d: ---\n", aid);
     }
@@ -106,13 +147,11 @@ void updateDisplay() {
 }
 
 void sendToPC() {
-  // Format: "TAG:<d1>,<d2>,<d3>\n"
-  // Send 0.0 if an anchor hasn't been heard from yet
   float d[4] = {0, 0, 0, 0};
   for (int i = 0; i < NUM_ANCHORS; i++) {
     int aid = anchorIdForAddr(anchors[i].shortAddr);
-    if (aid >= 1 && aid <= 3 && anchors[i].active) {
-      d[aid] = anchors[i].distance;
+    if (aid >= 1 && aid <= 3 && anchors[i].active && anchors[i].initialized) {
+      d[aid] = anchors[i].smoothedDistance;  // ← smoothed, not raw
     }
   }
 
@@ -124,7 +163,7 @@ void sendToPC() {
   Serial.printf("-> PC: %s", msg);
 }
 
-// ─── DW1000Ranging callbacks ─────────────────────────────────────────────────
+// ─── DW1000Ranging callbacks ──────────────────────────────────────────────────
 
 void newRange() {
   uint16_t addr = DW1000Ranging.getDistantDevice()->getShortAddress();
@@ -132,12 +171,15 @@ void newRange() {
 
   int idx = findAnchorIndex(addr);
   if (idx >= 0) {
-    anchors[idx].distance = dist;
-    anchors[idx].active   = true;
-  }
+    bool accepted = applyFilter(anchors[idx], dist);
+    anchors[idx].active = true;
 
-  int aid = anchorIdForAddr(addr);
-  Serial.printf("Anchor %d [%04X]: %.3f m\n", aid, addr, dist);
+    int aid = anchorIdForAddr(addr);
+    if (accepted) {
+      Serial.printf("Anchor %d [%04X]: raw=%.3f smooth=%.3f m\n",
+                    aid, addr, dist, anchors[idx].smoothedDistance);
+    }
+  }
 }
 
 void newDevice(DW1000Device* device) {
@@ -146,7 +188,10 @@ void newDevice(DW1000Device* device) {
   Serial.printf("New anchor %d [%04X] joined\n", aid, addr);
 
   int idx = findAnchorIndex(addr);
-  if (idx >= 0) anchors[idx].active = true;
+  if (idx >= 0) {
+    anchors[idx].active = true;
+    anchors[idx].initialized = false;  // reset filter on reconnect
+  }
 }
 
 void inactiveDevice(DW1000Device* device) {
@@ -155,17 +200,19 @@ void inactiveDevice(DW1000Device* device) {
   Serial.printf("Anchor %d [%04X] inactive\n", aid, addr);
 
   int idx = findAnchorIndex(addr);
-  if (idx >= 0) anchors[idx].active = false;
+  if (idx >= 0) {
+    anchors[idx].active      = false;
+    anchors[idx].initialized = false;  // reset filter so stale value isn't reused
+  }
 }
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
+// ─── Setup ────────────────────────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== UWB Tag (Pro with Display) ===");
+  Serial.println("\n=== UWB Tag (Pro with Display) v4-smooth ===");
 
-  // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED init failed — check SDA/SCL pins");
@@ -177,7 +224,6 @@ void setup() {
   display.println("UWB Tag Starting...");
   display.display();
 
-  // WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -187,28 +233,24 @@ void setup() {
   Serial.printf("\nWiFi: %s\n", WiFi.localIP().toString().c_str());
   udp.begin(UDP_PORT + 1);
 
-  // Must init SPI with explicit pins BEFORE calling DW1000Ranging.initCommunication
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, PIN_SS);
 
-  // Init DW1000Ranging
   DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);
   DW1000Ranging.attachNewRange(newRange);
   DW1000Ranging.attachNewDevice(newDevice);
   DW1000Ranging.attachInactiveDevice(inactiveDevice);
 
-  // Start as tag — library automatically handles polling all nearby anchors
   DW1000Ranging.startAsTag(TAG_ADDRESS, DW1000.MODE_LONGDATA_RANGE_LOWPOWER, false);
 
-  Serial.println("Tag ready — ranging started");
+  Serial.println("Tag ready — ranging started (smooth mode)");
   updateDisplay();
 }
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
+// ─── Loop ─────────────────────────────────────────────────────────────────────
 
 void loop() {
   DW1000Ranging.loop();
 
-  // Send distances to PC and update display periodically
   if (millis() - lastSendTime > SEND_INTERVAL_MS) {
     lastSendTime = millis();
     sendToPC();
