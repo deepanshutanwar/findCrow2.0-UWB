@@ -1,18 +1,18 @@
-# findCrow 2.0 — UWB Indoor Tracking System
+# findCrow 2.0 - UWB Indoor Tracking System
 
 Real-time, coordinate-level indoor positioning using Ultra-Wideband (UWB) ranging, trilateration, and a live Python visualizer with Kalman filtering.
 
 > **Problem:** BLE-based indoor tracking is limited to room-level detection due to RSSI variance from multipath fading and signal reflections. 
 
-> **Solution:** findCrow 2.0 replaces BLE with UWB to achieve centimeter-accurate localization.
+> **Solution:** findCrow 2.0 replaces BLE with UWB to achieve accurate localisation.
 
 ---
 
 ## Demo
 
-> 📹 *Tag moving across a living area tracked in real time across 3 anchors*
+> *Tag moving across a living area tracked in real time across 3 anchors*
 
-![Demo GIF — add your screen recording here](demo.gif)
+https://github.com/user-attachments/assets/eea45b10-e283-4232-8f8a-05dae770cd47
 
 ---
 
@@ -26,7 +26,7 @@ Real-time, coordinate-level indoor positioning using Ultra-Wideband (UWB) rangin
 
 1. **Anchors** continuously range against the tag using UWB Time-of-Flight (TWR protocol via DW1000).
 2. **Tag** receives distances from all 3 anchors, applies EMA smoothing + outlier rejection, and streams results over UDP.
-3. **Visualizer** runs trilateration, applies a median pre-filter and 2D Kalman filter, and plots the live position with trail.
+3. **Visualizer** runs trilateration, applies a median pre-filter and 2D Kalman filter, and plots the live position with a trail.
 
 ---
 
@@ -56,9 +56,9 @@ findcrow2/
 
 ## Anchor Placement Tips
 
-- Place anchors at known positions forming a large triangle — wider spacing = better geometry (lower DOP).
+- Place anchors at known positions forming a large triangle
 - Avoid placing anchors collinear (all on one wall).
-- Keep anchors at the same height as the tag if possible, or account for height difference.
+- Keep anchors at the same height as the tag if possible, or account for height differences.
 
 ---
 
