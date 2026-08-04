@@ -10,6 +10,9 @@ Real-time, coordinate-level indoor positioning using Ultra-Wideband (UWB) rangin
 
 ## Demo
 
+<img width="422" height="349" alt="image" src="https://github.com/user-attachments/assets/83564dd4-14fa-41bf-987e-6a6c88198e8a" />
+
+
 > *Tag moving across a living area tracked in real time across 3 anchors*
 
 
