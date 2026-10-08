@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/dd7af299-cf21-4aa9-8abb-17baf95801d8
+
 # findCrow 2.0 - UWB Indoor Tracking System
 
 Real-time, coordinate-level indoor positioning using Ultra-Wideband (UWB) ranging, trilateration, and a live Python visualizer with Kalman filtering.
@@ -16,11 +20,7 @@ Real-time, coordinate-level indoor positioning using Ultra-Wideband (UWB) rangin
 > *Tag moving across a living area tracked in real time across 3 anchors*
 
 
-
-https://github.com/user-attachments/assets/b239ed72-50e2-4591-a226-485b0110656a
-
-
-
+https://github.com/user-attachments/assets/5fbf6bab-57e2-43f2-ab98-8742bac2eb4d
 
 
 ---
